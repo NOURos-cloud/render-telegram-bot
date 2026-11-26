@@ -319,6 +319,7 @@ _COOKIELESS_CLIENTS = (["visionos", "android_vr"], ["android_vr"], ["web_safari"
 def _download_youtube_pytubefix(url: str, output_dir: Path, progress: Progress | None) -> list[str]:
     try:
         from pytubefix import YouTube
+        from pytubefix.botGuard import bot_guard
     except ImportError as exc:
         raise RuntimeError("pytubefix is not installed") from exc
 
@@ -329,16 +330,65 @@ def _download_youtube_pytubefix(url: str, output_dir: Path, progress: Progress |
         if total:
             progress(total - bytes_remaining, total)
 
-    video = YouTube(url, client="WEB", on_progress_callback=on_progress)
-    stream = video.streams.get_highest_resolution()
-    if stream is None:
-        stream = next((item for item in video.streams if item.is_progressive and item.type == "video"), None)
-    if stream is None:
-        raise RuntimeError("no progressive stream available")
-    path = stream.download(output_path=str(output_dir), skip_existing=False)
-    if not path:
-        raise RuntimeError("pytubefix returned no file")
-    return [path]
+    # PO token (proof-of-origin): YouTube now requires it on the WEB
+    # client or it answers LOGIN_REQUIRED / "detected as a bot" from a
+    # flagged datacenter IP. pytubefix never sends one unless
+    # use_po_token=True + a verifier is given, so mint it locally with
+    # BotGuard under the pip Node wheel (nodejs-wheel-binaries, already
+    # installed as a pytubefix dependency). No cookies involved.
+    # Diagnostics only (token length + first 4 chars, never the token).
+    def _make_verifier(holder: dict):
+        def _po_token_verifier():
+            yt = holder["yt"]
+            visitor_data = getattr(yt, "visitor_data", None)
+            try:
+                token = bot_guard.generate_po_token(yt.video_id)
+            except Exception as exc:
+                print(f"[pytubefix] po_token mint failed: {exc}", flush=True)
+                raise
+            print(
+                f"[pytubefix] po_token minted: len={len(token) if token else 0} "
+                f"prefix={(token or '')[:4]} visitor_data={'yes' if visitor_data else 'no'}",
+                flush=True,
+            )
+            return visitor_data, token
+
+        return _po_token_verifier
+
+    last_error: Exception | None = None
+    for _client in ("WEB", "WEB_EMBED"):
+        holder: dict = {}
+        try:
+            video = YouTube(
+                url,
+                client=_client,
+                use_po_token=True,
+                po_token_verifier=_make_verifier(holder),
+                allow_oauth_cache=False,
+                token_file=str(output_dir / "pytubefix-tokens.json"),
+                on_progress_callback=on_progress,
+            )
+            holder["yt"] = video
+        except Exception as exc:
+            last_error = exc
+            continue
+        try:
+            stream = video.streams.get_highest_resolution()
+            if stream is None:
+                stream = next(
+                    (item for item in video.streams if item.is_progressive and item.type == "video"),
+                    None,
+                )
+            if stream is None:
+                raise RuntimeError("no progressive stream available")
+            path = stream.download(output_path=str(output_dir), skip_existing=False)
+            if not path:
+                raise RuntimeError("pytubefix returned no file")
+            return [path]
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise RuntimeError(f"pytubefix download failed: {last_error}") from last_error
 
 
 def download_youtube(
