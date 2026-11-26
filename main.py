@@ -31,10 +31,10 @@ def _load_cookies(env_name, filename):
     if os.environ.get(env_name):
         with open(path, "w") as _f:
             _f.write(os.environ[env_name])
-        print(f"YouTube cookies loaded from {env_name}", flush=True)
+        print(f"Cookies loaded from {env_name}", flush=True)
         return path
     if os.path.exists(path):
-        print(f"YouTube cookies loaded from file {filename}", flush=True)
+        print(f"Cookies loaded from file {filename}", flush=True)
         return path
     return None
 
@@ -43,6 +43,15 @@ _COOKIES_PATH = _load_cookies("YOUTUBE_COOKIES", "youtube_cookies.txt")
 _COOKIES_PATH_2 = _load_cookies("YOUTUBE_COOKIES_2", "youtube_cookies2.txt")
 if not _COOKIES_PATH:
     print("No YouTube cookies configured", flush=True)
+
+# Instagram cookies (optional, Railway Variable INSTAGRAM_COOKIES):
+# same idea as YouTube - Instagram's API refuses unauthenticated
+# requests from datacenter IPs, so a logged-in session makes reels
+# download reliably. Export instagram.com cookies.txt the same way
+# (Kiwi + Get cookies.txt LOCALLY) and paste as a secret.
+_IG_COOKIES_PATH = _load_cookies("INSTAGRAM_COOKIES", "instagram_cookies.txt")
+if not _IG_COOKIES_PATH:
+    print("No Instagram cookies configured", flush=True)
 
 # Admin chat for failure alerts (optional, Railway Variable ADMIN_CHAT_ID):
 # when YouTube downloads fail with a sign-in error (cookies dead), the bot
@@ -179,7 +188,7 @@ def _download_with_ytdlp(url, cookiefile):
         "merge_output_format": "mp4",
         "max_filesize": 50 * 1024 * 1024,
         "geo_bypass": True,
-        "no_check_certificate": True,
+        "nocheckcertificate": True,
         "socket_timeout": 30,
         **({"cookiefile": cookiefile} if cookiefile else {}),
         # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
@@ -205,7 +214,7 @@ def _download_with_ytdlp(url, cookiefile):
         except Exception as e:
             last_exc = e
             if attempt < 2 and _is_transient_error(e):
-                time.sleep(3)
+                time.sleep(3 * (attempt + 1))
                 continue
             raise
     raise last_exc
@@ -220,6 +229,11 @@ def download_handler(message):
         return
     url = match.group(0)
 
+    # YouTube Music links fail with 403 even with cookies; the same video
+    # works on regular YouTube, so rewrite the host before downloading.
+    if "music.youtube.com" in url:
+        url = url.replace("music.youtube.com", "www.youtube.com", 1)
+
     # TikTok photo posts are image slideshows, not videos, and yt-dlp
     # cannot download them at all. Say so plainly instead of failing.
     if "tiktok.com" in url and "/photo/" in url:
@@ -228,8 +242,15 @@ def download_handler(message):
 
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     is_youtube = "youtube.com" in url or "youtu.be" in url
-    # Cookie sets to try in order (YouTube only). Other sites ignore cookies.
-    cookie_files = [_p for _p in (_COOKIES_PATH, _COOKIES_PATH_2) if _p] if is_youtube else []
+    is_instagram = "instagram.com" in url
+    # Cookie sets to try in order (YouTube only). Instagram uses its own
+    # session cookies when configured, otherwise no cookies.
+    if is_youtube:
+        cookie_files = [_p for _p in (_COOKIES_PATH, _COOKIES_PATH_2) if _p]
+    elif is_instagram and _IG_COOKIES_PATH:
+        cookie_files = [_IG_COOKIES_PATH]
+    else:
+        cookie_files = []
     if not cookie_files:
         cookie_files = [None]
     filename = None
@@ -256,6 +277,8 @@ def download_handler(message):
         send_file(message.chat.id, filename, (info or {}).get("title", ""))
         bot.reply_to(message, "تم ✅")
     except Exception as e:
+        # Log the real error so Railway logs show what actually failed.
+        print(f"[download] failed: {url} -> {e}", flush=True)
         # YouTube bot-check: fall back to cobalt API silently (no message).
         if is_youtube:
             cookie_dead = _is_cookie_failure(e)
@@ -276,7 +299,14 @@ def download_handler(message):
             _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
     finally:
-        _clean_download_dir()
+        # Remove only this download's file (and any partial file), not the
+        # whole folder, so a simultaneous download is never wiped.
+        for _p in (filename, (filename + ".part") if filename else None):
+            if _p and os.path.exists(_p):
+                try:
+                    os.remove(_p)
+                except OSError:
+                    pass
 
 
 def run_bot():
