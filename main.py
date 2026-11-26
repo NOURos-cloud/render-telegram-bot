@@ -19,6 +19,21 @@ app = Flask(__name__)
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# YouTube cookies (optional, from Railway Variable YOUTUBE_COOKIES):
+# paste the contents of a youtube.com cookies.txt export here as a secret.
+# yt-dlp uses them to pass YouTube's "Sign in to confirm you're not a bot"
+# check, which blocks datacenter IPs like Railway's. Never commit cookies.
+_COOKIES_PATH = os.path.join(DOWNLOAD_DIR, "youtube_cookies.txt")
+if os.environ.get("YOUTUBE_COOKIES"):
+    with open(_COOKIES_PATH, "w") as _f:
+        _f.write(os.environ["YOUTUBE_COOKIES"])
+    print("YouTube cookies loaded from YOUTUBE_COOKIES", flush=True)
+elif os.path.exists(_COOKIES_PATH):
+    print("YouTube cookies loaded from file", flush=True)
+else:
+    _COOKIES_PATH = None
+    print("No YouTube cookies configured", flush=True)
+
 URL_RE = re.compile(r"https?://\S+")
 
 SUPPORTED = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com")
@@ -133,6 +148,7 @@ def download_handler(message):
         "max_filesize": 50 * 1024 * 1024,
         "geo_bypass": True,
         "no_check_certificate": True,
+        **({"cookiefile": _COOKIES_PATH} if _COOKIES_PATH else {}),
         # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
         # Forcing android/ios alone makes it worse with current yt-dlp (needs PO token).
         # tv + web_embedded + android_vr is the most reliable combo in 2026.
