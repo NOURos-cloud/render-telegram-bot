@@ -225,6 +225,19 @@ def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess
         return None
 
 
+def _run_env(cmd: list[str], cwd: Path, timeout: int, extra_env: dict) -> subprocess.CompletedProcess | None:
+    """Like _run but with extra environment variables merged in."""
+    try:
+        env = dict(os.environ)
+        env.update(extra_env)
+        return subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout, env=env
+        )
+    except Exception as exc:
+        _log(f"command failed: {' '.join(cmd[:2])} -> {exc}")
+        return None
+
+
 def _ensure_account(wgcf: Path, warp_dir: Path) -> Path | None:
     """Register a free anonymous WARP identity (once) and generate the
     WireGuard profile (once). Returns the profile path or None."""
@@ -232,11 +245,38 @@ def _ensure_account(wgcf: Path, warp_dir: Path) -> Path | None:
     profile = warp_dir / "wgcf-profile.conf"
 
     if not account.is_file():
-        _log("registering anonymous WARP identity (wgcf register) ...")
-        res = _run([str(wgcf), "register"], warp_dir, _WGCF_TIMEOUT)
-        if res is None or res.returncode != 0 or not account.is_file():
-            err = (res.stderr or res.stdout or "")[-300:] if res else ""
-            _log(f"wgcf register failed (rc={res.returncode if res else '?'}): {err}")
+        # Pre-check: can we reach Cloudflare's registration API at all?
+        # If the host blocks it, wgcf register cannot succeed and we
+        # should say so plainly instead of retrying blindly.
+        try:
+            req = urllib.request.Request(
+                "https://api.cloudflareclient.com/v0a4005/reg",
+                headers={"User-Agent": "warp-bot/1.0"},
+                method="GET",
+            )
+            urllib.request.urlopen(req, timeout=15)
+            _log("Cloudflare API reachable (register endpoint answered)")
+        except Exception as exc:
+            _log(f"Cloudflare API NOT reachable from this host: {exc}")
+        # Retry registration: the first attempt can fail transiently
+        # (DNS / TLS / API hiccup). Set HOME explicitly — wgcf writes
+        # its account file relative to it on some setups.
+        env_home = str(warp_dir)
+        ok = False
+        for attempt in range(1, 4):
+            _log(f"registering anonymous WARP identity (wgcf register, attempt {attempt}/3) ...")
+            res = _run_env([str(wgcf), "register"], warp_dir, _WGCF_TIMEOUT, {"HOME": env_home})
+            if res is not None and res.returncode == 0 and account.is_file():
+                ok = True
+                break
+            # Log the FULL output (not truncated) so the real error is visible.
+            out = ""
+            if res is not None:
+                out = (res.stdout or "") + "\n" + (res.stderr or "")
+            _log(f"wgcf register failed (rc={res.returncode if res else '?'}): {out.strip()[:2000]}")
+            if attempt < 3:
+                time.sleep(15)
+        if not ok:
             return None
         _log("WARP identity registered")
     if not profile.is_file():
