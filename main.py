@@ -48,47 +48,57 @@ def is_supported(url):
 
 
 def try_cobalt(url):
-    """Fallback for YouTube: cobalt API downloads without yt-dlp cookies.
+    """Fallback for YouTube: try keyless cobalt instances in order.
+    api.cobalt.tools now needs a JWT/API key, so try community instances.
     Returns (filename, title) or None."""
-    try:
-        r = requests.post(
-            "https://api.cobalt.tools/",
-            json={
-                "url": url,
-                "videoQuality": "720",
-                "filenameStyle": "basic",
-                "downloadMode": "auto",
-                "youtubeVideoCodec": "h264",
-            },
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=60,
-        )
-        data = r.json()
-        status = data.get("status")
-        if status == "picker":
-            items = data.get("picker") or []
-            if not items:
-                return None
-            dl_url = items[0].get("url")
-            filename = items[0].get("filename") or "video.mp4"
-        elif status in ("tunnel", "redirect"):
-            dl_url = data.get("url")
-            filename = data.get("filename") or "video.mp4"
-        else:
-            return None
-        if not dl_url:
-            return None
-        filename = os.path.join(DOWNLOAD_DIR, os.path.basename(filename))
-        with requests.get(dl_url, stream=True, timeout=120) as resp:
-            resp.raise_for_status()
-            with open(filename, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        title = os.path.splitext(os.path.basename(filename))[0]
-        return filename, title
-    except Exception:
-        return None
+    instances = [
+        "https://dwnld.nichind.dev",
+        "https://cobaltapi.kittycat.boo",
+        "https://api.dl.woof.monster",
+        "https://cobaltapi.squair.xyz",
+        "https://lime.clxxped.lol",
+    ]
+    for base in instances:
+        try:
+            r = requests.post(
+                base + "/",
+                json={
+                    "url": url,
+                    "videoQuality": "720",
+                    "filenameStyle": "basic",
+                    "downloadMode": "auto",
+                    "youtubeVideoCodec": "h264",
+                },
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                timeout=30,
+            )
+            data = r.json()
+            status = data.get("status")
+            if status == "picker":
+                items = data.get("picker") or []
+                if not items:
+                    continue
+                dl_url = items[0].get("url")
+                filename = items[0].get("filename") or "video.mp4"
+            elif status in ("tunnel", "redirect"):
+                dl_url = data.get("url")
+                filename = data.get("filename") or "video.mp4"
+            else:
+                continue
+            if not dl_url:
+                continue
+            filename = os.path.join(DOWNLOAD_DIR, os.path.basename(filename))
+            with requests.get(dl_url, stream=True, timeout=120) as resp:
+                resp.raise_for_status()
+                with open(filename, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            title = os.path.splitext(os.path.basename(filename))[0]
+            return filename, title
+        except Exception:
+            continue
+    return None
 
 
 def send_file(chat_id, filename, title):

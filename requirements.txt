@@ -3,3 +3,4 @@ pyTelegramBotAPI
 requests
 gunicorn
 yt-dlp
+bgutil-ytdlp-pot-provider
