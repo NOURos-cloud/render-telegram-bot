@@ -1,8 +1,11 @@
 import os
 import threading
+import re
+import glob
 
 from flask import Flask
 import telebot
+from yt_dlp import YoutubeDL
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -10,6 +13,13 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+
+DOWNLOAD_DIR = "/tmp/downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+URL_RE = re.compile(r"https?://\S+")
+
+SUPPORTED = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com")
 
 
 @app.get("/")
@@ -24,12 +34,68 @@ def health():
 
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
-    bot.reply_to(message, "البوت يعمل ✅")
+    bot.reply_to(
+        message,
+        "ابعت لينك من يوتيوب أو تيك توك أو انستجرام، وهحمله وابعتهولك هنا.\n"
+        "مثال: ابعت لينك فيديو، واستنى شوية لحد ما يتحمل.\n"
+        "ملحوظة: الفيديوهات الكبيرة أكتر من 50 ميجا مش هتتبعت من التيليجرام.",
+    )
+
+
+def is_supported(url):
+    return any(host in url for host in SUPPORTED)
 
 
 @bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    bot.reply_to(message, message.text)
+def download_handler(message):
+    text = message.text or ""
+    match = URL_RE.search(text)
+    if not match:
+        bot.reply_to(message, "ابعت لينك صحيح من يوتيوب أو تيك توك أو انستجرام.")
+        return
+    url = match.group(0)
+    if not is_supported(url):
+        bot.reply_to(message, "اللينك ده مش مدعوم. ابعت لينك من يوتيوب أو تيك توك أو انستجرام.")
+        return
+
+    bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
+    outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+    ydl_opts = {
+        "format": "best[filesize<=45M]/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "noplaylist": True,
+        "merge_output_format": "mp4",
+        "max_filesize": 50 * 1024 * 1024,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+        if not os.path.exists(filename):
+            matches = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
+            filename = max(matches, key=os.path.getctime) if matches else None
+        if not filename or not os.path.exists(filename):
+            bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
+            return
+        size = os.path.getsize(filename)
+        if size > 50 * 1024 * 1024:
+            bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
+            return
+        with open(filename, "rb") as f:
+            if filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv")):
+                bot.send_video(message.chat.id, f, caption=info.get("title", "")[:200])
+            else:
+                bot.send_document(message.chat.id, f, caption=info.get("title", "")[:200])
+        bot.reply_to(message, "تم ✅")
+    except Exception as e:
+        bot.reply_to(message, f"حصل خطأ في التحميل: {e}")
+    finally:
+        for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def run_bot():
