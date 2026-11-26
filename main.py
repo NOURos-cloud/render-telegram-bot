@@ -19,13 +19,17 @@ try:
     from cookies_vault import CookieVault
     from downloader import classify as classify_url
     from downloader import download as download_any
+    from downloader import download_youtube as download_youtube_cookiefree
     _UNIVERSAL_DL = True
+    _YT_COOKIEFREE = True
 except Exception as _dl_err:
     print(f"Universal downloader unavailable: {_dl_err}", flush=True)
     CookieVault = None
     classify_url = None
     download_any = None
+    download_youtube_cookiefree = None
     _UNIVERSAL_DL = False
+    _YT_COOKIEFREE = False
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -114,6 +118,7 @@ def send_welcome(message):
     bot.reply_to(
         message,
         "ابعت أي لينك فيديو من أي موقع، وهحمله وابعتهولك هنا.\n"
+        "لليوتيوب: ابعت اللينك عادي، بيشتغل من غير كوكيز دلوقتي، أو استخدم /yt <رابط يوتيوب>.\n"
         "للتورنت والملفات المباشرة: /dl <رابط> (ولليوتيوب بالكوكيز: /dlc <رابط>).\n"
         "مثال: ابعت لينك فيديو، واستنى شوية لحد ما يتحمل.\n"
         "ملحوظة: الفيديوهات الكبيرة أكتر من 50 ميجا مش هتتبعت من التيليجرام.",
@@ -502,6 +507,45 @@ def _save_cookie_file(message, name):
         bot.reply_to(message, "فشل الحفظ: تأكد إن الملف cookies.txt صحيح.")
 
 
+@bot.message_handler(commands=["yt"])
+def handle_yt(message):
+    # Cookie-free YouTube download (yt-dlp with visionos/android_vr
+    # clients, then pytubefix). Open to everyone, like /dl.
+    if not _YT_COOKIEFREE:
+        bot.reply_to(message, "التحميل بدون كوكيز مش متاح دلوقتي.")
+        return
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "الاستخدام: /yt <رابط يوتيوب>")
+        return
+    url = parts[1].strip()
+    if "music.youtube.com" in url:
+        url = url.replace("music.youtube.com", "www.youtube.com", 1)
+    if "youtube.com" not in url and "youtu.be" not in url:
+        bot.reply_to(message, "الأمر ده لليوتيوب بس. ابعت لينك يوتيوب.")
+        return
+    notice = bot.reply_to(message, "جارٍ تحميل يوتيوب بدون كوكيز... ⏳")
+    yt_dir = os.path.join(DOWNLOAD_DIR, f"dl-yt-{message.chat.id}-{int(time.time())}")
+    os.makedirs(yt_dir, exist_ok=True)
+    try:
+        files = download_youtube_cookiefree(
+            url,
+            output_dir=yt_dir,
+            progress=_dl_progress_editor(message.chat.id, notice.message_id),
+        )
+        sent = _deliver_dl_files(message, files)
+        if sent:
+            bot.edit_message_text("تم ✅ (بدون كوكيز)", message.chat.id, notice.message_id)
+        else:
+            bot.edit_message_text("معرفتش أحمل الفيديو ده، جرب لينك تاني.", message.chat.id, notice.message_id)
+    except Exception as e:
+        print(f"[yt] failed: {url} -> {e}", flush=True)
+        bot.edit_message_text("معرفتش أحمل الفيديو ده، جرب لينك تاني.", message.chat.id, notice.message_id)
+    finally:
+        shutil.rmtree(yt_dir, ignore_errors=True)
+
+
 @bot.message_handler(func=lambda message: True)
 def download_handler(message):
     text = message.text or ""
@@ -542,19 +586,31 @@ def download_handler(message):
     info = None
     cookie_dead = False
     try:
-        for _idx, _cookie in enumerate(cookie_files):
+        # Cookie-free YouTube first (works without cookies now via
+        # visionos/android_vr clients + pytubefix); fall back to the
+        # cookie sets below if it fails.
+        if is_youtube and _YT_COOKIEFREE:
             try:
-                filename, info = _download_with_ytdlp(url, _cookie)
-                break
-            except Exception as e:
-                if is_youtube and _idx < len(cookie_files) - 1:
-                    # Try the next cookie set. A stale set can fail in
-                    # ways that don't say "sign in" (e.g. YouTube's
-                    # "The page needs to be reloaded"), so fail over on
-                    # any YouTube error, not just sign-in errors.
-                    _clean_download_dir()
-                    continue
-                raise
+                _cf_files = download_youtube_cookiefree(url, output_dir=DOWNLOAD_DIR)
+                if _cf_files:
+                    filename = _cf_files[0]
+                    info = {"title": os.path.splitext(os.path.basename(filename))[0]}
+            except Exception as _cf_e:
+                print(f"[download] cookiefree YouTube failed: {url} -> {_cf_e}", flush=True)
+        if not filename:
+            for _idx, _cookie in enumerate(cookie_files):
+                try:
+                    filename, info = _download_with_ytdlp(url, _cookie)
+                    break
+                except Exception as e:
+                    if is_youtube and _idx < len(cookie_files) - 1:
+                        # Try the next cookie set. A stale set can fail in
+                        # ways that don't say "sign in" (e.g. YouTube's
+                        # "The page needs to be reloaded"), so fail over on
+                        # any YouTube error, not just sign-in errors.
+                        _clean_download_dir()
+                        continue
+                    raise
         if not filename or not os.path.exists(filename):
             bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return

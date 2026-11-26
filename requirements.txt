@@ -7,3 +7,6 @@ bgutil-ytdlp-pot-provider
 gallery-dl
 httpx>=0.27
 libtorrent==2.0.11; python_version < "3.13"
+pytubefix==11.2.2
+quickjs==1.19.4; python_version < "3.14"
+yt-dlp-ejs>=0.8.0

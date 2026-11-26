@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import ipaddress
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -279,6 +281,107 @@ def _extract_media(url: str, options: dict) -> list[str]:
                 if candidate and Path(candidate).is_file() and candidate not in files:
                     files.append(candidate)
         return files
+
+
+def _js_runtime_options() -> dict:
+    # yt-dlp needs a JS runtime to decipher YouTube signatures / PO
+    # tokens. Prefer quickjs (pip package, works on Railway), else a
+    # system runtime (Deno is already in the Dockerfile).
+    if importlib.util.find_spec("quickjs") is not None:
+        return {"js_runtimes": {"quickjs": {}}}
+    for name in ("node", "deno", "bun"):
+        if shutil.which(name):
+            return {"js_runtimes": {name: {}}}
+    return {}
+
+
+def _progress_hook(callback: Progress | None):
+    if callback is None:
+        return None
+
+    def hook(data: dict) -> None:
+        if data.get("status") != "downloading":
+            return
+        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+        done = data.get("downloaded_bytes") or 0
+        if total:
+            callback(done, total)
+
+    return hook
+
+
+# Player clients that get past YouTube's datacenter-IP bot-check without
+# cookies (verified from a datacenter IP, no cookies). visionos is the
+# key one; the rest are fallbacks, then pytubefix.
+_COOKIELESS_CLIENTS = (["visionos", "android_vr"], ["android_vr"], ["web_safari", "android"], None)
+
+
+def _download_youtube_pytubefix(url: str, output_dir: Path, progress: Progress | None) -> list[str]:
+    try:
+        from pytubefix import YouTube
+    except ImportError as exc:
+        raise RuntimeError("pytubefix is not installed") from exc
+
+    def on_progress(stream, chunk, bytes_remaining: int) -> None:
+        if progress is None:
+            return
+        total = getattr(stream, "filesize", 0) or 0
+        if total:
+            progress(total - bytes_remaining, total)
+
+    video = YouTube(url, client="WEB", on_progress_callback=on_progress)
+    stream = video.streams.get_highest_resolution()
+    if stream is None:
+        stream = next((item for item in video.streams if item.is_progressive and item.type == "video"), None)
+    if stream is None:
+        raise RuntimeError("no progressive stream available")
+    path = stream.download(output_path=str(output_dir), skip_existing=False)
+    if not path:
+        raise RuntimeError("pytubefix returned no file")
+    return [path]
+
+
+def download_youtube(
+    url: str,
+    output_dir: str = "downloads",
+    *,
+    progress: Progress | None = None,
+    format_id: str | None = None,
+) -> list[str]:
+    """Download a YouTube URL without cookies. Tries yt-dlp with
+    cookieless player clients first (visionos/android_vr etc., with a JS
+    runtime for signature/PO-token deciphering), then pytubefix.
+    Uses the same safe yt-dlp settings as _media_options (short %(id)s
+    filenames, 45M format cap, 50M max_filesize, nocheckcertificate).
+    Raises RuntimeError if every attempt fails."""
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    hook = _progress_hook(progress)
+    last_error: Exception | None = None
+
+    for clients in _COOKIELESS_CLIENTS:
+        options = _media_options(directory)
+        options.update(_js_runtime_options())
+        options["format"] = format_id or "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best"
+        if clients is not None:
+            options["extractor_args"] = {"youtube": {"player_client": clients}}
+        if hook:
+            options["progress_hooks"] = [hook]
+        try:
+            files = _extract_media(url, options)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if files:
+            return files
+        last_error = RuntimeError("no files were produced")
+
+    try:
+        return _download_youtube_pytubefix(url, directory, progress)
+    except Exception as exc:
+        last_error = exc
+
+    raise RuntimeError(f"cookie-free YouTube download failed: {last_error}") from last_error
 
 
 def download_media(
