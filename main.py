@@ -61,12 +61,22 @@ def download_handler(message):
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
     ydl_opts = {
-        "format": "best[filesize<=45M]/best",
+        "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
         "outtmpl": outtmpl,
         "quiet": True,
         "noplaylist": True,
         "merge_output_format": "mp4",
         "max_filesize": 50 * 1024 * 1024,
+        "geo_bypass": True,
+        "no_check_certificate": True,
+        # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
+        # The Android/iOS player clients usually bypass that check without cookies.
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
     }
     try:
         with YoutubeDL(ydl_opts) as ydl:
