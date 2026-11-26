@@ -36,8 +36,6 @@ else:
 
 URL_RE = re.compile(r"https?://\S+")
 
-SUPPORTED = ("youtube.com", "youtu.be", "tiktok.com", "instagram.com")
-
 
 @app.get("/")
 def keep_alive():
@@ -53,14 +51,10 @@ def health():
 def send_welcome(message):
     bot.reply_to(
         message,
-        "ابعت لينك من يوتيوب أو تيك توك أو انستجرام، وهحمله وابعتهولك هنا.\n"
+        "ابعت أي لينك فيديو من أي موقع، وهحمله وابعتهولك هنا.\n"
         "مثال: ابعت لينك فيديو، واستنى شوية لحد ما يتحمل.\n"
         "ملحوظة: الفيديوهات الكبيرة أكتر من 50 ميجا مش هتتبعت من التيليجرام.",
     )
-
-
-def is_supported(url):
-    return any(host in url for host in SUPPORTED)
 
 
 def try_cobalt(url):
@@ -130,12 +124,9 @@ def download_handler(message):
     text = message.text or ""
     match = URL_RE.search(text)
     if not match:
-        bot.reply_to(message, "ابعت لينك صحيح من يوتيوب أو تيك توك أو انستجرام.")
+        bot.reply_to(message, "ابعت لينك صحيح.")
         return
     url = match.group(0)
-    if not is_supported(url):
-        bot.reply_to(message, "اللينك ده مش مدعوم. ابعت لينك من يوتيوب أو تيك توك أو انستجرام.")
-        return
 
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
@@ -148,6 +139,7 @@ def download_handler(message):
         "max_filesize": 50 * 1024 * 1024,
         "geo_bypass": True,
         "no_check_certificate": True,
+        "socket_timeout": 30,
         **({"cookiefile": _COOKIES_PATH} if _COOKIES_PATH else {}),
         # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
         # Forcing android/ios alone makes it worse with current yt-dlp (needs PO token).
