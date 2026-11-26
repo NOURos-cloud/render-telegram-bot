@@ -12,6 +12,21 @@ import requests
 import telebot
 from yt_dlp import YoutubeDL
 
+# OpenCode's universal downloader (direct files + torrents + media).
+# Imported defensively: if it ever fails to load, the main catch-all
+# handler below keeps working and /dl just reports unavailable.
+try:
+    from cookies_vault import CookieVault
+    from downloader import classify as classify_url
+    from downloader import download as download_any
+    _UNIVERSAL_DL = True
+except Exception as _dl_err:
+    print(f"Universal downloader unavailable: {_dl_err}", flush=True)
+    CookieVault = None
+    classify_url = None
+    download_any = None
+    _UNIVERSAL_DL = False
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -56,6 +71,26 @@ _IG_COOKIES_PATH = _load_cookies("INSTAGRAM_COOKIES", "instagram_cookies.txt")
 if not _IG_COOKIES_PATH:
     print("No Instagram cookies configured", flush=True)
 
+# Cookie vault for the /dl command: seed it from the same YouTube cookie
+# env vars, so /dl can use cookies for YouTube without a separate
+# COOKIES_JSON variable. The vault file lives in /tmp and is re-seeded
+# from env vars on every startup (Railway's filesystem is ephemeral).
+_vault = None
+if _UNIVERSAL_DL:
+    try:
+        _vault = CookieVault(path=os.path.join(DOWNLOAD_DIR, "vault.json"))
+        for _name, _env in (("youtube1", "YOUTUBE_COOKIES"), ("youtube2", "YOUTUBE_COOKIES_2")):
+            _content = os.environ.get(_env)
+            if _content:
+                try:
+                    _vault.add(_name, _content, replace=True)
+                    print(f"Vault seeded: {_name}", flush=True)
+                except Exception as _e:
+                    print(f"Vault seed {_name} failed: {_e}", flush=True)
+    except Exception as _e:
+        print(f"Cookie vault unavailable: {_e}", flush=True)
+        _vault = None
+
 # Admin chat for failure alerts (optional, Railway Variable ADMIN_CHAT_ID):
 # when YouTube downloads fail with a sign-in error (cookies dead), the bot
 # sends a short alert here so the cookies can be renewed quickly.
@@ -79,6 +114,7 @@ def send_welcome(message):
     bot.reply_to(
         message,
         "ابعت أي لينك فيديو من أي موقع، وهحمله وابعتهولك هنا.\n"
+        "للتورنت والملفات المباشرة: /dl <رابط> (ولليوتيوب بالكوكيز: /dlc <رابط>).\n"
         "مثال: ابعت لينك فيديو، واستنى شوية لحد ما يتحمل.\n"
         "ملحوظة: الفيديوهات الكبيرة أكتر من 50 ميجا مش هتتبعت من التيليجرام.",
     )
@@ -281,6 +317,189 @@ def _download_with_ytdlp(url, cookiefile):
                 continue
             raise
     raise last_exc
+
+
+def _is_admin(chat_id):
+    # Cookie management (/cookies, /addcookie) is admin-only. The admin is
+    # the same ADMIN_CHAT_ID used for failure alerts.
+    return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
+
+
+MAX_DL_FILES = 5
+MAX_SEND_BYTES = 50 * 1024 * 1024
+
+
+def _dl_progress_editor(chat_id, message_id):
+    # Throttled progress display: update at most every 10% or 5 seconds,
+    # so Telegram isn't spammed with edits.
+    state = {"percent": -10, "at": 0.0}
+
+    def update(done, total):
+        percent = int(done * 100 / total) if total else 0
+        now = time.monotonic()
+        if percent < state["percent"] + 10 and now - state["at"] < 5:
+            return
+        state["percent"] = percent
+        state["at"] = now
+        try:
+            bot.edit_message_text(f"جارٍ التحميل... {percent}%", chat_id, message_id)
+        except Exception:
+            pass
+
+    return update
+
+
+def _deliver_dl_files(message, files):
+    # Send downloaded files (videos as video, the rest as documents),
+    # biggest first, at most MAX_DL_FILES, skipping anything over 50MB.
+    # Returns how many were sent. Deletes every file afterwards so the
+    # server disk never fills up.
+    sent = 0
+    existing = [p for p in files if p and os.path.exists(p)]
+    existing.sort(key=lambda p: os.path.getsize(p), reverse=True)
+    try:
+        for path in existing[:MAX_DL_FILES]:
+            size = os.path.getsize(path)
+            if size > MAX_SEND_BYTES:
+                bot.reply_to(message, f"{os.path.basename(path)} أكبر من 50 ميجا، مش هيتبعت.")
+                continue
+            try:
+                send_file(message.chat.id, path, os.path.splitext(os.path.basename(path))[0])
+                sent += 1
+            except Exception:
+                bot.reply_to(message, f"تعذر إرسال {os.path.basename(path)}")
+        if len(existing) > MAX_DL_FILES:
+            bot.reply_to(message, f"اتبعت أول {MAX_DL_FILES} ملفات من {len(existing)}.")
+    finally:
+        for path in existing:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return sent
+
+
+@bot.message_handler(commands=["dl", "dlc"])
+def handle_dl(message):
+    if not _UNIVERSAL_DL:
+        bot.reply_to(message, "التحميل المتقدم مش متاح دلوقتي.")
+        return
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "الاستخدام: /dl <رابط>")
+        return
+    url = parts[1].strip()
+    with_cookies = parts[0].lower().endswith("dlc")
+    # Same normalisations as the main handler.
+    if "music.youtube.com" in url:
+        url = url.replace("music.youtube.com", "www.youtube.com", 1)
+    if "tiktok.com" in url and "/photo/" in url:
+        bot.reply_to(message, "اللينك ده صور مش فيديو، والبوت بينزل فيديوهات بس.")
+        return
+    backend = classify_url(url) if classify_url else "media"
+    is_instagram = "instagram.com" in url
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    notice = bot.reply_to(message, "جارٍ التحميل... ⏳")
+    # A private output dir per call, so a failed /dl never leaves files
+    # behind and never touches another download in progress.
+    dl_dir = os.path.join(DOWNLOAD_DIR, f"dl-{message.chat.id}-{int(time.time())}")
+    os.makedirs(dl_dir, exist_ok=True)
+    try:
+        files = None
+        # Retry transient errors once (not for torrents: restarting a
+        # torrent download from scratch is not a retry).
+        attempts = 1 if backend == "torrent" else 2
+        for _a in range(attempts):
+            try:
+                result = download_any(
+                    url,
+                    vault=_vault,
+                    output_dir=dl_dir,
+                    allow_cookie_fallback=with_cookies,
+                    progress=_dl_progress_editor(message.chat.id, notice.message_id),
+                )
+                files = result.files
+                break
+            except Exception as e:
+                if _a < attempts - 1 and _is_transient_error(e):
+                    time.sleep(5)
+                    continue
+                raise
+        if not files:
+            raise RuntimeError("no files were downloaded")
+        sent = _deliver_dl_files(message, files)
+        if sent:
+            bot.edit_message_text(f"تم ✅ ({backend})", message.chat.id, notice.message_id)
+        else:
+            bot.edit_message_text("معرفتش أحمل الفيديو ده، جرب لينك تاني.", message.chat.id, notice.message_id)
+    except Exception as e:
+        print(f"[dl] failed: {url} -> {e}", flush=True)
+        # Second tool for media, same as the main handler.
+        if backend == "media" and not is_instagram:
+            gdl = _download_with_gallery_dl(url)
+            if gdl:
+                filename, title = gdl
+                try:
+                    if os.path.getsize(filename) > MAX_SEND_BYTES:
+                        bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
+                        return
+                    send_file(message.chat.id, filename, title)
+                    bot.edit_message_text("تم ✅", message.chat.id, notice.message_id)
+                    return
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        os.remove(filename)
+                    except OSError:
+                        pass
+        if is_youtube and _is_cookie_failure(e):
+            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
+        bot.edit_message_text("معرفتش أحمل الفيديو ده، جرب لينك تاني.", message.chat.id, notice.message_id)
+    finally:
+        shutil.rmtree(dl_dir, ignore_errors=True)
+
+
+@bot.message_handler(commands=["cookies"])
+def list_cookies(message):
+    if not _is_admin(message.chat.id) or not _UNIVERSAL_DL or _vault is None:
+        return
+    rows = _vault.summary()
+    if not rows:
+        bot.reply_to(message, "لا توجد كوكيز مخزنة")
+        return
+    lines = []
+    for row in rows:
+        state = "معطل" if row["disabled"] else "فعال"
+        lines.append(f"{row['name']} - {state} - فشل={row['failures']}")
+    bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["addcookie"])
+def ask_cookie_file(message):
+    if not _is_admin(message.chat.id) or not _UNIVERSAL_DL or _vault is None:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "الاستخدام: /addcookie <name> ثم أرسل ملف cookies.txt")
+        return
+    name = parts[1].strip()
+    prompt = bot.reply_to(message, f"أرسل ملف cookies.txt للحساب: {name}")
+    bot.register_next_step_handler(prompt, lambda msg: _save_cookie_file(msg, name))
+
+
+def _save_cookie_file(message, name):
+    if message.document is None:
+        bot.reply_to(message, "لم أستلم ملفاً")
+        return
+    try:
+        raw = bot.download_file(message.document.file_path).decode("utf-8")
+        _vault.add(name, raw, replace=True)
+        bot.reply_to(message, f"تم حفظ الكوكيز باسم {name} ✅")
+    except Exception as exc:
+        print(f"[addcookie] failed: {exc}", flush=True)
+        bot.reply_to(message, "فشل الحفظ: تأكد إن الملف cookies.txt صحيح.")
 
 
 @bot.message_handler(func=lambda message: True)

@@ -9,5 +9,15 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: YOUTUBE_COOKIES
+        sync: false
+      - key: YOUTUBE_COOKIES_2
+        sync: false
+      - key: INSTAGRAM_COOKIES
+        sync: false
+      - key: TORRENT_TIMEOUT
+        value: "300"
       - key: PYTHON_VERSION
         value: 3.11.11
