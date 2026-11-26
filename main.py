@@ -176,9 +176,8 @@ def download_handler(message):
         send_file(message.chat.id, filename, info.get("title", ""))
         bot.reply_to(message, "تم ✅")
     except Exception as e:
-        # YouTube bot-check: fall back to cobalt API, which needs no cookies.
+        # YouTube bot-check: fall back to cobalt API silently (no message).
         if "youtube.com" in url or "youtu.be" in url:
-            bot.reply_to(message, "يوتيوب قفل التحميل المباشر، بجرب طريقة تانية... ⏳")
             result = try_cobalt(url)
             if result:
                 filename, title = result
@@ -190,9 +189,9 @@ def download_handler(message):
                     bot.reply_to(message, "تم ✅")
                     return
                 except Exception as e2:
-                    bot.reply_to(message, f"حصل خطأ في التحميل: {e2}")
+                    bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
                     return
-        bot.reply_to(message, f"حصل خطأ في التحميل: {e}")
+        bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
     finally:
         for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
             try:
