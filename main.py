@@ -19,20 +19,35 @@ app = Flask(__name__)
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# YouTube cookies (optional, from Railway Variable YOUTUBE_COOKIES):
-# paste the contents of a youtube.com cookies.txt export here as a secret.
-# yt-dlp uses them to pass YouTube's "Sign in to confirm you're not a bot"
-# check, which blocks datacenter IPs like Railway's. Never commit cookies.
-_COOKIES_PATH = os.path.join(DOWNLOAD_DIR, "youtube_cookies.txt")
-if os.environ.get("YOUTUBE_COOKIES"):
-    with open(_COOKIES_PATH, "w") as _f:
-        _f.write(os.environ["YOUTUBE_COOKIES"])
-    print("YouTube cookies loaded from YOUTUBE_COOKIES", flush=True)
-elif os.path.exists(_COOKIES_PATH):
-    print("YouTube cookies loaded from file", flush=True)
-else:
-    _COOKIES_PATH = None
+# YouTube cookies (optional, from Railway Variables YOUTUBE_COOKIES and
+# YOUTUBE_COOKIES_2): paste the contents of a youtube.com cookies.txt
+# export here as a secret. yt-dlp uses them to pass YouTube's
+# "Sign in to confirm you're not a bot" check, which blocks datacenter
+# IPs like Railway's. The bot tries the first set, and if YouTube rejects
+# it with a sign-in error it automatically tries the second set (exported
+# from a different Google account). Never commit cookies.
+def _load_cookies(env_name, filename):
+    path = os.path.join(DOWNLOAD_DIR, filename)
+    if os.environ.get(env_name):
+        with open(path, "w") as _f:
+            _f.write(os.environ[env_name])
+        print(f"YouTube cookies loaded from {env_name}", flush=True)
+        return path
+    if os.path.exists(path):
+        print(f"YouTube cookies loaded from file {filename}", flush=True)
+        return path
+    return None
+
+
+_COOKIES_PATH = _load_cookies("YOUTUBE_COOKIES", "youtube_cookies.txt")
+_COOKIES_PATH_2 = _load_cookies("YOUTUBE_COOKIES_2", "youtube_cookies2.txt")
+if not _COOKIES_PATH:
     print("No YouTube cookies configured", flush=True)
+
+# Admin chat for failure alerts (optional, Railway Variable ADMIN_CHAT_ID):
+# when YouTube downloads fail with a sign-in error (cookies dead), the bot
+# sends a short alert here so the cookies can be renewed quickly.
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 
 URL_RE = re.compile(r"https?://\S+")
 
@@ -119,16 +134,31 @@ def send_file(chat_id, filename, title):
             bot.send_document(chat_id, f, caption=(title or "")[:200])
 
 
-@bot.message_handler(func=lambda message: True)
-def download_handler(message):
-    text = message.text or ""
-    match = URL_RE.search(text)
-    if not match:
-        bot.reply_to(message, "ابعت لينك صحيح.")
-        return
-    url = match.group(0)
+def _is_cookie_failure(exc):
+    msg = str(exc).lower()
+    return "sign in to confirm" in msg or "confirm you're not a bot" in msg
 
-    bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
+
+def _notify_admin(text):
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        bot.send_message(int(ADMIN_CHAT_ID), text)
+    except Exception:
+        pass
+
+
+def _clean_download_dir():
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _download_with_ytdlp(url, cookiefile):
+    """Download with yt-dlp using one cookie file (or None).
+    Returns (filename, info). Raises on failure."""
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
     ydl_opts = {
         "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
@@ -140,7 +170,7 @@ def download_handler(message):
         "geo_bypass": True,
         "no_check_certificate": True,
         "socket_timeout": 30,
-        **({"cookiefile": _COOKIES_PATH} if _COOKIES_PATH else {}),
+        **({"cookiefile": cookiefile} if cookiefile else {}),
         # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
         # Forcing android/ios alone makes it worse with current yt-dlp (needs PO token).
         # tv + web_embedded + android_vr is the most reliable combo in 2026.
@@ -151,13 +181,44 @@ def download_handler(message):
             }
         },
     }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+    if not os.path.exists(filename):
+        matches = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
+        filename = max(matches, key=os.path.getctime) if matches else None
+    return filename, info
+
+
+@bot.message_handler(func=lambda message: True)
+def download_handler(message):
+    text = message.text or ""
+    match = URL_RE.search(text)
+    if not match:
+        bot.reply_to(message, "ابعت لينك صحيح.")
+        return
+    url = match.group(0)
+
+    bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    # Cookie sets to try in order (YouTube only). Other sites ignore cookies.
+    cookie_files = [_p for _p in (_COOKIES_PATH, _COOKIES_PATH_2) if _p] if is_youtube else []
+    if not cookie_files:
+        cookie_files = [None]
+    filename = None
+    info = None
+    cookie_dead = False
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-        if not os.path.exists(filename):
-            matches = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
-            filename = max(matches, key=os.path.getctime) if matches else None
+        for _idx, _cookie in enumerate(cookie_files):
+            try:
+                filename, info = _download_with_ytdlp(url, _cookie)
+                break
+            except Exception as e:
+                if is_youtube and _is_cookie_failure(e) and _idx < len(cookie_files) - 1:
+                    # This cookie set is dead; clean up and try the next one.
+                    _clean_download_dir()
+                    continue
+                raise
         if not filename or not os.path.exists(filename):
             bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return
@@ -165,11 +226,12 @@ def download_handler(message):
         if size > 50 * 1024 * 1024:
             bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
             return
-        send_file(message.chat.id, filename, info.get("title", ""))
+        send_file(message.chat.id, filename, (info or {}).get("title", ""))
         bot.reply_to(message, "تم ✅")
     except Exception as e:
         # YouTube bot-check: fall back to cobalt API silently (no message).
-        if "youtube.com" in url or "youtu.be" in url:
+        if is_youtube:
+            cookie_dead = _is_cookie_failure(e)
             result = try_cobalt(url)
             if result:
                 filename, title = result
@@ -183,13 +245,11 @@ def download_handler(message):
                 except Exception as e2:
                     bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
                     return
+        if is_youtube and cookie_dead:
+            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
     finally:
-        for path in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        _clean_download_dir()
 
 
 def run_bot():
