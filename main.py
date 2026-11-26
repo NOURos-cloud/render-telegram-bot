@@ -156,9 +156,20 @@ def _clean_download_dir():
             pass
 
 
+def _is_transient_error(exc):
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "timed out", "timeout", "connection", "temporarily",
+        "429", "too many requests", "502", "503", "500",
+        "not granting access", "try again",
+    ))
+
+
 def _download_with_ytdlp(url, cookiefile):
     """Download with yt-dlp using one cookie file (or None).
-    Returns (filename, info). Raises on failure."""
+    Returns (filename, info). Raises on failure.
+    Retries transient errors (timeouts, rate limits, 5xx) up to 3 times,
+    because Instagram/TikTok often fail once and succeed on retry."""
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
     ydl_opts = {
         "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
@@ -181,13 +192,23 @@ def _download_with_ytdlp(url, cookiefile):
             }
         },
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-    if not os.path.exists(filename):
-        matches = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
-        filename = max(matches, key=os.path.getctime) if matches else None
-    return filename, info
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+            if not os.path.exists(filename):
+                matches = glob.glob(os.path.join(DOWNLOAD_DIR, "*"))
+                filename = max(matches, key=os.path.getctime) if matches else None
+            return filename, info
+        except Exception as e:
+            last_exc = e
+            if attempt < 2 and _is_transient_error(e):
+                time.sleep(3)
+                continue
+            raise
+    raise last_exc
 
 
 @bot.message_handler(func=lambda message: True)
@@ -198,6 +219,12 @@ def download_handler(message):
         bot.reply_to(message, "ابعت لينك صحيح.")
         return
     url = match.group(0)
+
+    # TikTok photo posts are image slideshows, not videos, and yt-dlp
+    # cannot download them at all. Say so plainly instead of failing.
+    if "tiktok.com" in url and "/photo/" in url:
+        bot.reply_to(message, "اللينك ده صور مش فيديو، والبوت بينزل فيديوهات بس.")
+        return
 
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     is_youtube = "youtube.com" in url or "youtu.be" in url
