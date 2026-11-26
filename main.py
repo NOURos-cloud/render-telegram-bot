@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import re
 import glob
 
@@ -185,7 +186,15 @@ def download_handler(message):
 
 
 def run_bot():
-    bot.infinity_polling(skip_pending=True, timeout=60)
+    # If polling dies (e.g. Telegram 409 Conflict when an old instance is
+    # still shutting down during a redeploy), retry instead of leaving
+    # Flask alive with a dead bot thread and no replies at all.
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60)
+        except Exception as e:
+            print(f"Polling stopped: {e}, retrying in 5s...", flush=True)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
