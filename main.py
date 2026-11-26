@@ -243,12 +243,15 @@ def download_handler(message):
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     is_youtube = "youtube.com" in url or "youtu.be" in url
     is_instagram = "instagram.com" in url
-    # Cookie sets to try in order (YouTube only). Instagram uses its own
-    # session cookies when configured, otherwise no cookies.
+    # Cookie sets to try in order. YouTube tries both of its sets.
+    # Instagram: use its own session cookies if configured, otherwise
+    # fall back to the same cookie file the old working version passed
+    # for every download (harmless - those cookies are for youtube.com
+    # and are never sent to instagram.com).
     if is_youtube:
         cookie_files = [_p for _p in (_COOKIES_PATH, _COOKIES_PATH_2) if _p]
-    elif is_instagram and _IG_COOKIES_PATH:
-        cookie_files = [_IG_COOKIES_PATH]
+    elif is_instagram:
+        cookie_files = [_p for _p in (_IG_COOKIES_PATH, _COOKIES_PATH) if _p]
     else:
         cookie_files = []
     if not cookie_files:
