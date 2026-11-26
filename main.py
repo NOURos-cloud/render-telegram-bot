@@ -1,4 +1,7 @@
 import os
+import shutil
+import subprocess
+import sys
 import threading
 import time
 import re
@@ -145,7 +148,14 @@ def send_file(chat_id, filename, title):
 
 def _is_cookie_failure(exc):
     msg = str(exc).lower()
-    return "sign in to confirm" in msg or "confirm you're not a bot" in msg
+    # "The page needs to be reloaded" is YouTube rejecting a stale
+    # session without saying "sign in" outright - same remedy: try the
+    # next cookie set, and alert the admin if all sets fail this way.
+    return (
+        "sign in to confirm" in msg
+        or "confirm you're not a bot" in msg
+        or "the page needs to be reloaded" in msg
+    )
 
 
 def _notify_admin(text):
@@ -174,12 +184,65 @@ def _is_transient_error(exc):
     ))
 
 
+def _download_with_gallery_dl(url):
+    """Second download tool (gallery-dl) for sites where yt-dlp fails.
+    Works for Facebook, TikTok, Twitter/X and others; does NOT support
+    YouTube or Instagram (Instagram needs a login). Returns
+    (filename, title) or None. Merges separate video+audio with ffmpeg
+    when gallery-dl splits them, and moves the result to DOWNLOAD_DIR."""
+    outdir = os.path.join(DOWNLOAD_DIR, "gdl")
+    shutil.rmtree(outdir, ignore_errors=True)
+    os.makedirs(outdir, exist_ok=True)
+    _gdl = shutil.which("gallery-dl")
+    _cmd = ([_gdl] if _gdl else [sys.executable, "-m", "gallery_dl"]) + [
+        "--no-check-certificate", "-d", outdir, url,
+    ]
+    try:
+        subprocess.run(_cmd, capture_output=True, text=True, timeout=180)
+    except Exception:
+        return None
+    videos = []
+    for _root, _dirs, _files in os.walk(outdir):
+        for _fn in _files:
+            if _fn.lower().endswith((".mp4", ".webm", ".mov", ".mkv")):
+                videos.append(os.path.join(_root, _fn))
+    if not videos:
+        shutil.rmtree(outdir, ignore_errors=True)
+        return None
+    video = max(videos, key=os.path.getsize)
+    base = os.path.splitext(video)[0]
+    audio = None
+    for _ext in (".m4a", ".mp3", ".opus", ".aac"):
+        if os.path.exists(base + _ext):
+            audio = base + _ext
+            break
+    if audio:
+        merged = base + "_merged.mp4"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", video, "-i", audio, "-c", "copy", merged],
+                capture_output=True, timeout=120, check=True,
+            )
+            if os.path.exists(merged) and os.path.getsize(merged) > 0:
+                video = merged
+        except Exception:
+            pass
+    title = os.path.splitext(os.path.basename(video))[0]
+    dest = os.path.join(DOWNLOAD_DIR, os.path.basename(video))
+    try:
+        os.rename(video, dest)
+    except OSError:
+        dest = video
+    shutil.rmtree(outdir, ignore_errors=True)
+    return dest, title
+
+
 def _download_with_ytdlp(url, cookiefile):
     """Download with yt-dlp using one cookie file (or None).
     Returns (filename, info). Raises on failure.
-    Retries transient errors (timeouts, rate limits, 5xx) up to 3 times,
+    Retries transient errors (timeouts, rate limits, 5xx) up to 4 times,
     because Instagram/TikTok often fail once and succeed on retry."""
-    outtmpl = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
+    outtmpl = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
     ydl_opts = {
         "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
         "outtmpl": outtmpl,
@@ -202,7 +265,7 @@ def _download_with_ytdlp(url, cookiefile):
         },
     }
     last_exc = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -213,8 +276,8 @@ def _download_with_ytdlp(url, cookiefile):
             return filename, info
         except Exception as e:
             last_exc = e
-            if attempt < 2 and _is_transient_error(e):
-                time.sleep(3 * (attempt + 1))
+            if attempt < 3 and _is_transient_error(e):
+                time.sleep(5 * (2 ** attempt))
                 continue
             raise
     raise last_exc
@@ -265,8 +328,11 @@ def download_handler(message):
                 filename, info = _download_with_ytdlp(url, _cookie)
                 break
             except Exception as e:
-                if is_youtube and _is_cookie_failure(e) and _idx < len(cookie_files) - 1:
-                    # This cookie set is dead; clean up and try the next one.
+                if is_youtube and _idx < len(cookie_files) - 1:
+                    # Try the next cookie set. A stale set can fail in
+                    # ways that don't say "sign in" (e.g. YouTube's
+                    # "The page needs to be reloaded"), so fail over on
+                    # any YouTube error, not just sign-in errors.
                     _clean_download_dir()
                     continue
                 raise
@@ -298,6 +364,23 @@ def download_handler(message):
                 except Exception as e2:
                     bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
                     return
+        else:
+            # Second tool: gallery-dl often succeeds where yt-dlp fails
+            # (different extraction). Skip for Instagram (needs login).
+            if not is_instagram:
+                gdl = _download_with_gallery_dl(url)
+                if gdl:
+                    filename, title = gdl
+                    try:
+                        if os.path.getsize(filename) > 50 * 1024 * 1024:
+                            bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
+                            return
+                        send_file(message.chat.id, filename, title)
+                        bot.reply_to(message, "تم ✅")
+                        return
+                    except Exception:
+                        bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
+                        return
         if is_youtube and cookie_dead:
             _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
