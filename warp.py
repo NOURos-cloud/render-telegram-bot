@@ -261,11 +261,17 @@ def _ensure_account(wgcf: Path, warp_dir: Path) -> Path | None:
         # Retry registration: the first attempt can fail transiently
         # (DNS / TLS / API hiccup). Set HOME explicitly — wgcf writes
         # its account file relative to it on some setups.
+        # NOTE: wgcf register is INTERACTIVE by default — it shows a
+        # Cloudflare Terms-of-Service prompt ("Do you agree? Yes/No")
+        # and waits for arrow-key input. In a non-interactive host
+        # (FadeHost) stdin is EOF immediately, so it fails in checkTOS
+        # before ever reaching the network. --accept-tos accepts the
+        # TOS non-interactively and is REQUIRED here.
         env_home = str(warp_dir)
         ok = False
         for attempt in range(1, 4):
-            _log(f"registering anonymous WARP identity (wgcf register, attempt {attempt}/3) ...")
-            res = _run_env([str(wgcf), "register"], warp_dir, _WGCF_TIMEOUT, {"HOME": env_home})
+            _log(f"registering anonymous WARP identity (wgcf register --accept-tos, attempt {attempt}/3) ...")
+            res = _run_env([str(wgcf), "register", "--accept-tos"], warp_dir, _WGCF_TIMEOUT, {"HOME": env_home})
             if res is not None and res.returncode == 0 and account.is_file():
                 ok = True
                 break
