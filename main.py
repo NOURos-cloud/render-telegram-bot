@@ -31,6 +31,15 @@ except Exception as _dl_err:
     _UNIVERSAL_DL = False
     _YT_COOKIEFREE = False
 
+# Cloudflare WARP egress (optional): when the host's datacenter IP is
+# blocked by YouTube / Instagram geo-blocks, downloads go through
+# WARP's SOCKS5 proxy instead. Defensive import - if warp.py is
+# missing or broken, downloads just use direct egress as before.
+try:
+    from warp import ensure_warp as _ensure_warp
+except Exception:
+    _ensure_warp = None
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
@@ -294,6 +303,9 @@ def _download_with_ytdlp(url, cookiefile):
         "geo_bypass": True,
         "nocheckcertificate": True,
         "socket_timeout": 30,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 8,
         **({"cookiefile": cookiefile} if cookiefile else {}),
         # YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot".
         # Forcing android/ios alone makes it worse with current yt-dlp (needs PO token).
@@ -305,6 +317,16 @@ def _download_with_ytdlp(url, cookiefile):
             }
         },
     }
+    # WARP egress (if up) for YouTube and Instagram only: YouTube's
+    # datacenter-IP block and Instagram's US-IP geo-block both come
+    # from the host's egress IP. TikTok/Facebook/SoundCloud are fine
+    # direct, so they are left alone. Resolved once per download call,
+    # not per retry attempt.
+    if "youtube.com" in url or "youtu.be" in url or "instagram.com" in url:
+        _warp_proxy = _ensure_warp() if _ensure_warp else None
+        if _warp_proxy:
+            print(f"[download] using WARP proxy: {_warp_proxy}", flush=True)
+            ydl_opts["proxy"] = _warp_proxy
     last_exc = None
     for attempt in range(4):
         try:
@@ -460,7 +482,7 @@ def handle_dl(message):
                     except OSError:
                         pass
         if is_youtube and _is_cookie_failure(e):
-            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
+            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل على FadeHost (يوتيوب حاجب آي بي السيرفر).")
         bot.edit_message_text("معرفتش أحمل الفيديو ده، جرب لينك تاني.", message.chat.id, notice.message_id)
     finally:
         shutil.rmtree(dl_dir, ignore_errors=True)
@@ -657,7 +679,7 @@ def download_handler(message):
                         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
                         return
         if is_youtube and cookie_dead:
-            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل، الكوكيز غالباً وقفت. جدّدها من Kiwi وحدّث YOUTUBE_COOKIES في Railway.")
+            _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل على FadeHost (يوتيوب حاجب آي بي السيرفر).")
         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
     finally:
         # Remove only this download's file (and any partial file), not the
@@ -684,5 +706,10 @@ def run_bot():
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot, daemon=True).start()
+    # Warm up WARP in the background so the first YouTube/Instagram
+    # download does not wait for the binary download + registration.
+    # Best-effort only: any failure just means direct egress.
+    if _ensure_warp is not None:
+        threading.Thread(target=_ensure_warp, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)

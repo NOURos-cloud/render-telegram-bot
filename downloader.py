@@ -9,6 +9,7 @@ import re
 import shutil
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,17 @@ import httpx
 from yt_dlp import YoutubeDL
 
 from cookies_vault import CookieError, CookieVault
+
+# Cloudflare WARP egress (optional): when the host's datacenter IP is
+# blocked by YouTube, downloads go through WARP's SOCKS5/HTTP proxy
+# instead. Imported defensively - if warp.py is missing or broken,
+# everything just uses direct egress as before.
+try:
+    from warp import ensure_warp as _ensure_warp
+    from warp import warp_http_proxy as _warp_http_proxy
+except Exception:
+    _ensure_warp = None
+    _warp_http_proxy = None
 
 Progress = Callable[[int, int], None]
 
@@ -355,6 +367,16 @@ def _download_youtube_pytubefix(url: str, output_dir: Path, progress: Progress |
 
         return _po_token_verifier
 
+    # WARP egress (if up): pytubefix uses stdlib urllib, whose
+    # ProxyHandler cannot do SOCKS5, so it gets wireproxy's HTTP
+    # listener instead. When WARP is down, reset the global urllib
+    # opener first - a previous WARP-up call may have installed a
+    # proxy opener that would otherwise keep pointing at a dead proxy.
+    http_proxy = _warp_http_proxy() if _warp_http_proxy else None
+    if http_proxy is None:
+        urllib.request.install_opener(urllib.request.build_opener())
+    proxies = {"http": http_proxy, "https": http_proxy} if http_proxy else None
+
     last_error: Exception | None = None
     for _client in ("WEB", "WEB_EMBED"):
         holder: dict = {}
@@ -367,6 +389,7 @@ def _download_youtube_pytubefix(url: str, output_dir: Path, progress: Progress |
                 allow_oauth_cache=False,
                 token_file=str(output_dir / "pytubefix-tokens.json"),
                 on_progress_callback=on_progress,
+                proxies=proxies,
             )
             holder["yt"] = video
         except Exception as exc:
@@ -409,10 +432,19 @@ def download_youtube(
     hook = _progress_hook(progress)
     last_error: Exception | None = None
 
+    # WARP egress (if up): route yt-dlp through the SOCKS5 proxy so
+    # YouTube sees Cloudflare's IP instead of the host's flagged one.
+    # Resolved once per download, not per client attempt.
+    proxy = _ensure_warp() if _ensure_warp else None
+    if proxy:
+        print(f"[download] using WARP proxy for YouTube: {proxy}", flush=True)
+
     for clients in _COOKIELESS_CLIENTS:
         options = _media_options(directory)
         options.update(_js_runtime_options())
         options["format"] = format_id or "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best"
+        if proxy:
+            options["proxy"] = proxy
         if clients is not None:
             options["extractor_args"] = {"youtube": {"player_client": clients}}
         if hook:
