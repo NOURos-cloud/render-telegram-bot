@@ -126,10 +126,10 @@ def health():
 def send_welcome(message):
     bot.reply_to(
         message,
-        "ابعت أي لينك فيديو من أي موقع، وهحمله وابعتهولك هنا.\n"
+        "ابعت أي لينك فيديو أو صور من أي موقع، وهحمله وابعتهولك هنا.\n"
         "لليوتيوب: ابعت اللينك عادي، بيشتغل من غير كوكيز دلوقتي، أو استخدم /yt <رابط يوتيوب>.\n"
         "للتورنت والملفات المباشرة: /dl <رابط> (ولليوتيوب بالكوكيز: /dlc <رابط>).\n"
-        "مثال: ابعت لينك فيديو، واستنى شوية لحد ما يتحمل.\n"
+        "مثال: ابعت لينك فيديو أو بوست صور، واستنى شوية لحد ما يتحمل.\n"
         "ملحوظة: الفيديوهات الكبيرة أكتر من 50 ميجا مش هتتبعت من التيليجرام.",
     )
 
@@ -192,8 +192,31 @@ def send_file(chat_id, filename, title):
     with open(filename, "rb") as f:
         if filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv")):
             bot.send_video(chat_id, f, caption=(title or "")[:200])
+        elif filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            bot.send_photo(chat_id, f, caption=(title or "")[:200])
         else:
             bot.send_document(chat_id, f, caption=(title or "")[:200])
+
+
+_MEDIA_EXTS = (".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp")
+
+
+def _new_media_files(before):
+    # Files that appeared in DOWNLOAD_DIR during this download (a photo
+    # post / carousel yields several images, not just the one
+    # prepare_filename names). Sorted by size, biggest first.
+    out = []
+    try:
+        for name in os.listdir(DOWNLOAD_DIR):
+            if name in before:
+                continue
+            path = os.path.join(DOWNLOAD_DIR, name)
+            if os.path.isfile(path) and name.lower().endswith(_MEDIA_EXTS):
+                out.append(path)
+    except OSError:
+        pass
+    out.sort(key=lambda p: os.path.getsize(p), reverse=True)
+    return out
 
 
 def _is_cookie_failure(exc):
@@ -252,14 +275,31 @@ def _download_with_gallery_dl(url):
     except Exception:
         return None
     videos = []
+    images = []
     for _root, _dirs, _files in os.walk(outdir):
         for _fn in _files:
+            _p = os.path.join(_root, _fn)
             if _fn.lower().endswith((".mp4", ".webm", ".mov", ".mkv")):
-                videos.append(os.path.join(_root, _fn))
-    if not videos:
+                videos.append(_p)
+            elif _fn.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                images.append(_p)
+    if not videos and not images:
         shutil.rmtree(outdir, ignore_errors=True)
         return None
-    video = max(videos, key=os.path.getsize)
+    if videos:
+        video = max(videos, key=os.path.getsize)
+    else:
+        # Photo post: return the biggest image (the caller sends it as
+        # a photo via send_file).
+        video = max(images, key=os.path.getsize)
+        title = os.path.splitext(os.path.basename(video))[0]
+        dest = os.path.join(DOWNLOAD_DIR, os.path.basename(video))
+        try:
+            os.rename(video, dest)
+        except OSError:
+            dest = video
+        shutil.rmtree(outdir, ignore_errors=True)
+        return dest, title
     base = os.path.splitext(video)[0]
     audio = None
     for _ext in (".m4a", ".mp3", ".opus", ".aac"):
@@ -294,7 +334,7 @@ def _download_with_ytdlp(url, cookiefile):
     because Instagram/TikTok often fail once and succeed on retry."""
     outtmpl = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
     ydl_opts = {
-        "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
+        "format": "best[height<=720][ext=mp4][filesize<=45M]/best[height<=720][filesize<=45M]/best[height<=720]/best",
         "outtmpl": outtmpl,
         "quiet": True,
         "noplaylist": True,
@@ -421,9 +461,6 @@ def handle_dl(message):
     # Same normalisations as the main handler.
     if "music.youtube.com" in url:
         url = url.replace("music.youtube.com", "www.youtube.com", 1)
-    if "tiktok.com" in url and "/photo/" in url:
-        bot.reply_to(message, "اللينك ده صور مش فيديو، والبوت بينزل فيديوهات بس.")
-        return
     backend = classify_url(url) if classify_url else "media"
     is_instagram = "instagram.com" in url
     is_youtube = "youtube.com" in url or "youtu.be" in url
@@ -582,12 +619,6 @@ def download_handler(message):
     if "music.youtube.com" in url:
         url = url.replace("music.youtube.com", "www.youtube.com", 1)
 
-    # TikTok photo posts are image slideshows, not videos, and yt-dlp
-    # cannot download them at all. Say so plainly instead of failing.
-    if "tiktok.com" in url and "/photo/" in url:
-        bot.reply_to(message, "اللينك ده صور مش فيديو، والبوت بينزل فيديوهات بس.")
-        return
-
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
     is_youtube = "youtube.com" in url or "youtu.be" in url
     is_instagram = "instagram.com" in url
@@ -607,7 +638,14 @@ def download_handler(message):
     filename = None
     info = None
     cookie_dead = False
+    _downloaded = []
     try:
+        # Snapshot the download dir so a photo post / carousel can be
+        # collected as every file it produced, not just the first one.
+        try:
+            _before_files = set(os.listdir(DOWNLOAD_DIR))
+        except OSError:
+            _before_files = set()
         # Cookie-free YouTube first (works without cookies now via
         # visionos/android_vr clients + pytubefix); fall back to the
         # cookie sets below if it fails.
@@ -636,12 +674,26 @@ def download_handler(message):
         if not filename or not os.path.exists(filename):
             bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return
-        size = os.path.getsize(filename)
-        if size > 50 * 1024 * 1024:
-            bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
+        # Send every file this download produced (a photo post / carousel
+        # yields several images). Biggest first, at most 10, skipping
+        # anything over 50MB.
+        _downloaded = _new_media_files(_before_files)
+        if not _downloaded:
+            _downloaded = [filename]
+        _sent = 0
+        for _p in _downloaded[:10]:
+            if os.path.getsize(_p) > 50 * 1024 * 1024:
+                continue
+            try:
+                send_file(message.chat.id, _p, (info or {}).get("title", ""))
+                _sent += 1
+            except Exception:
+                continue
+        if _sent:
+            bot.reply_to(message, "تم ✅")
+        else:
+            bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return
-        send_file(message.chat.id, filename, (info or {}).get("title", ""))
-        bot.reply_to(message, "تم ✅")
     except Exception as e:
         # Log the real error so Railway logs show what actually failed.
         print(f"[download] failed: {url} -> {e}", flush=True)
@@ -682,9 +734,15 @@ def download_handler(message):
             _notify_admin("⚠️ تنبيه: تحميل اليوتيوب فشل على FadeHost (يوتيوب حاجب آي بي السيرفر).")
         bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
     finally:
-        # Remove only this download's file (and any partial file), not the
-        # whole folder, so a simultaneous download is never wiped.
-        for _p in (filename, (filename + ".part") if filename else None):
+        # Remove every file this download produced (and any partial
+        # file), not the whole folder, so a simultaneous download is
+        # never wiped.
+        _to_remove = list(_downloaded)
+        if filename and filename not in _to_remove:
+            _to_remove.append(filename)
+        if filename:
+            _to_remove.append(filename + ".part")
+        for _p in _to_remove:
             if _p and os.path.exists(_p):
                 try:
                     os.remove(_p)

@@ -248,7 +248,7 @@ def _media_options(output_dir: Path) -> dict:
     # tv/web_embedded/android_vr player clients that get past YouTube's
     # bot-check. concurrent_fragment_downloads speeds downloads up.
     return {
-        "format": "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best",
+        "format": "best[height<=720][ext=mp4][filesize<=45M]/best[height<=720][filesize<=45M]/best[height<=720]/best",
         "outtmpl": str(output_dir / "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -442,7 +442,7 @@ def download_youtube(
     for clients in _COOKIELESS_CLIENTS:
         options = _media_options(directory)
         options.update(_js_runtime_options())
-        options["format"] = format_id or "best[ext=mp4][filesize<=45M]/best[filesize<=45M]/best"
+        options["format"] = format_id or "best[height<=720][ext=mp4][filesize<=45M]/best[height<=720][filesize<=45M]/best[height<=720]/best"
         if proxy:
             options["proxy"] = proxy
         if clients is not None:
