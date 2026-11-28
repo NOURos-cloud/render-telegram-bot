@@ -130,60 +130,6 @@ def send_welcome(message):
     )
 
 
-def try_cobalt(url):
-    """Fallback for YouTube: try keyless cobalt instances in order.
-    api.cobalt.tools now needs a JWT/API key, so try community instances.
-    Returns (filename, title) or None."""
-    instances = [
-        "https://dwnld.nichind.dev",
-        "https://cobaltapi.kittycat.boo",
-        "https://api.dl.woof.monster",
-        "https://cobaltapi.squair.xyz",
-        "https://lime.clxxped.lol",
-    ]
-    for base in instances:
-        try:
-            r = requests.post(
-                base + "/",
-                json={
-                    "url": url,
-                    "videoQuality": "720",
-                    "filenameStyle": "basic",
-                    "downloadMode": "auto",
-                    "youtubeVideoCodec": "h264",
-                },
-                headers={"Accept": "application/json", "Content-Type": "application/json"},
-                timeout=30,
-            )
-            data = r.json()
-            status = data.get("status")
-            if status == "picker":
-                items = data.get("picker") or []
-                if not items:
-                    continue
-                dl_url = items[0].get("url")
-                filename = items[0].get("filename") or "video.mp4"
-            elif status in ("tunnel", "redirect"):
-                dl_url = data.get("url")
-                filename = data.get("filename") or "video.mp4"
-            else:
-                continue
-            if not dl_url:
-                continue
-            filename = os.path.join(DOWNLOAD_DIR, os.path.basename(filename))
-            with requests.get(dl_url, stream=True, timeout=120) as resp:
-                resp.raise_for_status()
-                with open(filename, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-            title = os.path.splitext(os.path.basename(filename))[0]
-            return filename, title
-        except Exception:
-            continue
-    return None
-
-
 def send_file(chat_id, filename, title):
     with open(filename, "rb") as f:
         if filename.lower().endswith((".mp4", ".mov", ".webm", ".mkv")):
@@ -616,6 +562,7 @@ def download_handler(message):
         url = url.replace("music.youtube.com", "www.youtube.com", 1)
 
     bot.reply_to(message, "بحمل الفيديو... استنى شوية ⏳")
+    _t0 = time.monotonic()  # timing: split download vs send (2026-11-28)
     is_youtube = "youtube.com" in url or "youtu.be" in url
     is_instagram = "instagram.com" in url
     # Cookie sets to try in order. YouTube tries both of its sets.
@@ -670,6 +617,7 @@ def download_handler(message):
         if not filename or not os.path.exists(filename):
             bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return
+        print(f"[timing] download took {time.monotonic() - _t0:.1f}s url={url}", flush=True)
         # Send every file this download produced (a photo post / carousel
         # yields several images). Biggest first, at most 10, skipping
         # anything over 50MB.
@@ -681,34 +629,27 @@ def download_handler(message):
             if os.path.getsize(_p) > 50 * 1024 * 1024:
                 continue
             try:
+                _st = time.monotonic()
                 send_file(message.chat.id, _p, (info or {}).get("title", ""))
+                print(f"[timing] send {os.path.basename(_p)} ({os.path.getsize(_p) // 1024}KB) took {time.monotonic() - _st:.1f}s", flush=True)
                 _sent += 1
             except Exception:
                 continue
         if _sent:
+            print(f"[timing] total {time.monotonic() - _t0:.1f}s sent={_sent} url={url}", flush=True)
             bot.reply_to(message, "تم ✅")
         else:
             bot.reply_to(message, "معرفتش أحمل الفيديو. جرب لينك تاني.")
             return
     except Exception as e:
-        # Log the real error so Railway logs show what actually failed.
+        # Log the real error so the logs show what actually failed.
         print(f"[download] failed: {url} -> {e}", flush=True)
-        # YouTube bot-check: fall back to cobalt API silently (no message).
+        print(f"[timing] failed after {time.monotonic() - _t0:.1f}s url={url}", flush=True)
+        # cobalt fallback removed 2026-11-28: every community instance
+        # is dead and each attempt burned up to 30s, so a YouTube
+        # failure waited minutes for nothing. Fail fast instead.
         if is_youtube:
             cookie_dead = _is_cookie_failure(e)
-            result = try_cobalt(url)
-            if result:
-                filename, title = result
-                try:
-                    if os.path.getsize(filename) > 50 * 1024 * 1024:
-                        bot.reply_to(message, "الفيديو كبير أكتر من 50 ميجا، والتيليجرام مش هيقبله.")
-                        return
-                    send_file(message.chat.id, filename, title)
-                    bot.reply_to(message, "تم ✅")
-                    return
-                except Exception as e2:
-                    bot.reply_to(message, "معرفتش أحمل الفيديو ده، جرب لينك تاني.")
-                    return
         else:
             # Second tool: gallery-dl often succeeds where yt-dlp fails
             # (different extraction). Skip for Instagram (needs login).

@@ -322,13 +322,16 @@ def _parse_wgcf_profile(profile: Path) -> dict | None:
     return data
 
 
-def _build_wireproxy_conf(profile: Path, dest: Path) -> Path | None:
+def _build_wireproxy_conf(profile: Path, dest: Path, endpoint: str | None = None) -> Path | None:
     """Build wireproxy.conf from the wgcf profile. Forces IPv4-only
     egress: AllowedIPs is 0.0.0.0/0 (no ::/0) and ResolveStrategy=ipv4,
-    so YouTube/googlevideo are always reached over IPv4."""
+    so YouTube/googlevideo are always reached over IPv4.
+    *endpoint* overrides the profile's Peer endpoint (used to retry
+    the WARP UDP ports 500/1701/4500 when 2408 is blocked)."""
     keys = _parse_wgcf_profile(profile)
     if keys is None:
         return None
+    endpoint = endpoint or keys["Peer.Endpoint"]
     conf = (
         "[Interface]\n"
         f"PrivateKey = {keys['Interface.PrivateKey']}\n"
@@ -341,7 +344,7 @@ def _build_wireproxy_conf(profile: Path, dest: Path) -> Path | None:
         "[Peer]\n"
         f"PublicKey = {keys['Peer.PublicKey']}\n"
         "AllowedIPs = 0.0.0.0/0\n"
-        f"Endpoint = {keys['Peer.Endpoint']}\n"
+        f"Endpoint = {endpoint}\n"
         "PersistentKeepalive = 25\n"
         "\n"
         "[Resolve]\n"
@@ -359,6 +362,55 @@ def _build_wireproxy_conf(profile: Path, dest: Path) -> Path | None:
     except OSError as exc:
         _log(f"could not write wireproxy config: {exc}")
         return None
+
+
+def _resolve_host_ipv4(host: str) -> str | None:
+    """Resolve *host* to an IPv4 address, or None. Used to try the WARP
+    endpoint by raw IP when DNS is the problem."""
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+        if infos:
+            return infos[0][4][0]
+    except OSError:
+        pass
+    return None
+
+
+def _candidate_endpoints(profile_endpoint: str) -> list[str]:
+    """Endpoints to try, in order: the profile's own endpoint first,
+    then the same host on Cloudflare WARP's other UDP ports
+    (500/1701/4500 — hosts sometimes block only 2408), then the
+    resolved IPv4 form (in case DNS is the problem). Deduplicated."""
+    host, sep, port = profile_endpoint.rpartition(":")
+    if not sep or not port.isdigit():
+        return [profile_endpoint]
+    out: list[str] = []
+    for p in (int(port), 500, 1701, 4500):
+        ep = f"{host}:{p}"
+        if ep not in out:
+            out.append(ep)
+    ip = _resolve_host_ipv4(host)
+    if ip and ip != host:
+        ep = f"{ip}:{port}"
+        if ep not in out:
+            out.append(ep)
+    return out
+
+
+def _dump_wireproxy_log_tail(warp_dir: Path, lines: int = 30) -> None:
+    """Print the tail of wireproxy's own log so the REAL tunnel error
+    (handshake timeout, no route, DNS failure, ...) is visible in the
+    bot logs instead of a bare 'did not verify'. The log never holds
+    the private key, but any line mentioning it is skipped anyway."""
+    try:
+        text = (warp_dir / "wireproxy.log").read_text(errors="ignore")
+    except OSError:
+        _log("wireproxy log not readable")
+        return
+    tail = [ln for ln in text.splitlines() if "PrivateKey" not in ln][-lines:]
+    _log("wireproxy.log tail:")
+    for ln in tail:
+        print(f"[warp-log] {ln}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +502,52 @@ def _proxy_works() -> bool:
     return False
 
 
+def _start_and_verify(wireproxy: Path, conf: Path, warp_dir: Path) -> bool:
+    """Start wireproxy with *conf*, wait for its SOCKS port, verify it
+    is really WARP. Returns True on success. On failure the process
+    is left in _PROC for the caller to stop with stop_warp() (except
+    when it already exited, where _PROC is cleared)."""
+    global _PROC
+    log_path = warp_dir / "wireproxy.log"
+    try:
+        log_f = open(log_path, "ab")
+    except OSError as exc:
+        _log(f"could not open wireproxy log: {exc}")
+        return False
+    try:
+        _PROC = subprocess.Popen(
+            [str(wireproxy), "-c", str(conf), "-i", f"127.0.0.1:{INFO_PORT}"],
+            stdout=log_f, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        _log(f"could not start wireproxy: {exc}")
+        _PROC = None
+        return False
+    finally:
+        # The child keeps its own fd; closing ours is safe.
+        try:
+            log_f.close()
+        except Exception:
+            pass
+
+    # Wait for the SOCKS listener, then verify it is really WARP.
+    deadline = time.monotonic() + _START_TIMEOUT
+    while time.monotonic() < deadline:
+        if _PROC.poll() is not None:
+            _log(f"wireproxy exited early (rc={_PROC.returncode}), see {log_path}")
+            _PROC = None
+            return False
+        if _port_open(SOCKS_PORT):
+            break
+        time.sleep(0.5)
+    else:
+        _log("wireproxy did not open the SOCKS port in time")
+        return False
+
+    return _proxy_works()
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -496,57 +594,29 @@ def ensure_warp() -> str | None:
         if profile is None:
             _STATUS = "down"
             return None
-        conf = _build_wireproxy_conf(profile, warp_dir / "wireproxy.conf")
-        if conf is None:
+        keys = _parse_wgcf_profile(profile)
+        if keys is None:
             _STATUS = "down"
             return None
-
-        log_path = warp_dir / "wireproxy.log"
-        try:
-            log_f = open(log_path, "ab")
-        except OSError as exc:
-            _log(f"could not open wireproxy log: {exc}")
-            _STATUS = "down"
-            return None
-        try:
-            _PROC = subprocess.Popen(
-                [str(wireproxy), "-c", str(conf), "-i", f"127.0.0.1:{INFO_PORT}"],
-                stdout=log_f, stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        except Exception as exc:
-            _log(f"could not start wireproxy: {exc}")
-            _STATUS = "down"
-            return None
-        finally:
-            # The child keeps its own fd; closing ours is safe.
-            try:
-                log_f.close()
-            except Exception:
-                pass
-
-        # Wait for the SOCKS listener, then verify it is really WARP.
-        deadline = time.monotonic() + _START_TIMEOUT
-        while time.monotonic() < deadline:
-            if _PROC.poll() is not None:
-                _log(f"wireproxy exited early (rc={_PROC.returncode}), see {log_path}")
-                _PROC, _STATUS = None, "down"
-                return None
-            if _port_open(SOCKS_PORT):
-                break
-            time.sleep(0.5)
-        else:
-            _log("wireproxy did not open the SOCKS port in time")
+        # Try the profile endpoint, then the same host on WARP's other
+        # UDP ports, then the raw-IP form. On FadeHost the first
+        # deploy proved the tunnel never establishes on 2408 (readyz
+        # fails, trace gets SOCKS 0x04 Host unreachable) — most
+        # likely outbound UDP 2408 is blocked, so another port may
+        # work. One setup run only; the result is cached.
+        for ep in _candidate_endpoints(keys["Peer.Endpoint"]):
+            _log(f"trying WARP endpoint {ep} ...")
+            conf = _build_wireproxy_conf(profile, warp_dir / "wireproxy.conf", endpoint=ep)
+            if conf is None:
+                continue
+            if _start_and_verify(wireproxy, conf, warp_dir):
+                _STATUS = "up"
+                _log(f"WARP is up (endpoint {ep}; SOCKS5 {SOCKS_URL}, HTTP {HTTP_URL})")
+                return SOCKS_URL
+            _log(f"WARP endpoint {ep} did not verify")
             stop_warp()
-            _STATUS = "down"
-            return None
-
-        if _proxy_works():
-            _STATUS = "up"
-            _log(f"WARP is up (SOCKS5 {SOCKS_URL}, HTTP {HTTP_URL})")
-            return SOCKS_URL
-        _log("WARP proxy did not verify (no warp=on), falling back to direct")
-        stop_warp()
+        _dump_wireproxy_log_tail(warp_dir)
+        _log("WARP proxy did not verify on any endpoint (no warp=on), falling back to direct")
         _STATUS = "down"
         return None
 
